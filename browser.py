@@ -22,8 +22,9 @@ import sys
 import os
 import json
 import base64
+import html.parser
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # ── Optional dependency: cryptography (for password encryption) ───────────────
 try:
@@ -35,7 +36,7 @@ try:
 except ImportError:
     CRYPTO_AVAILABLE = False
 
-from PySide6.QtCore import Qt, QUrl, QStandardPaths
+from PySide6.QtCore import Qt, QPoint, QUrl, QStandardPaths
 from PySide6.QtGui import QColor, QIcon, QKeySequence, QPalette, QShortcut
 from PySide6.QtWebEngineCore import (
     QWebEngineProfile,
@@ -47,19 +48,23 @@ from PySide6.QtWebEngineCore import (
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QTabBar,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -68,6 +73,13 @@ from PySide6.QtWidgets import (
 # ──────────────────────────── Constants ──────────────────────────────────────
 
 HOME_URL = "https://start.duckduckgo.com/"
+
+# Available search engines: key -> (display name, query URL prefix)
+SEARCH_ENGINES: Dict[str, Tuple[str, str]] = {
+    "duckduckgo": ("DuckDuckGo", "https://duckduckgo.com/?q="),
+    "google": ("Google", "https://www.google.com/search?q="),
+    "bing": ("Bing", "https://www.bing.com/search?q="),
+}
 
 # Known tracking / advertising hosts to block.
 TRACKING_HOSTS: frozenset = frozenset(
@@ -321,6 +333,103 @@ class BookmarkManager:
     def all(self) -> List[Dict[str, str]]:
         return list(self._items)
 
+    def import_html(self, path: str) -> int:
+        """Import bookmarks from a Netscape/Firefox HTML bookmarks file."""
+
+        class _Parser(html.parser.HTMLParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self.bookmarks: List[Dict[str, str]] = []
+                self._url: Optional[str] = None
+                self._title: str = ""
+                self._in_a: bool = False
+
+            def handle_starttag(self, tag: str, attrs: list) -> None:
+                if tag.lower() == "a":
+                    self._in_a = True
+                    self._url = dict(attrs).get("href", "")
+                    self._title = ""
+
+            def handle_endtag(self, tag: str) -> None:
+                if tag.lower() == "a" and self._in_a:
+                    self._in_a = False
+                    if self._url:
+                        self.bookmarks.append(
+                            {"title": self._title or self._url, "url": self._url}
+                        )
+                    self._url = None
+                    self._title = ""
+
+            def handle_data(self, data: str) -> None:
+                if self._in_a:
+                    self._title += data
+
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+        parser = _Parser()
+        parser.feed(content)
+        count = 0
+        for bm in parser.bookmarks:
+            if not any(b["url"] == bm["url"] for b in self._items):
+                self._items.append(bm)
+                count += 1
+        if count:
+            self._save()
+        return count
+
+
+# ────────────────────────── Config Manager ───────────────────────────────────
+
+
+class ConfigManager:
+    """Persists user preferences (search engine, onboarding state) in config.json."""
+
+    def __init__(self, data_dir: Path) -> None:
+        self._file = data_dir / "config.json"
+        self._data: Dict[str, Any] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if self._file.exists():
+            try:
+                self._data = json.loads(self._file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                self._data = {}
+
+    def save(self) -> None:
+        self._file.write_text(
+            json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+    # ── Onboarding ────────────────────────────────────────────────────────
+
+    @property
+    def onboarding_done(self) -> bool:
+        return bool(self._data.get("onboarding_done", False))
+
+    @onboarding_done.setter
+    def onboarding_done(self, value: bool) -> None:
+        self._data["onboarding_done"] = value
+
+    # ── Search engine ─────────────────────────────────────────────────────
+
+    @property
+    def search_engine(self) -> str:
+        key = self._data.get("search_engine", "duckduckgo")
+        return key if key in SEARCH_ENGINES else "duckduckgo"
+
+    @search_engine.setter
+    def search_engine(self, key: str) -> None:
+        if key in SEARCH_ENGINES:
+            self._data["search_engine"] = key
+
+    def search_engine_name(self) -> str:
+        return SEARCH_ENGINES[self.search_engine][0]
+
+    def build_search_url(self, query: str) -> str:
+        _, base_url = SEARCH_ENGINES[self.search_engine]
+        return base_url + query.replace(" ", "+")
+
 
 # ──────────────────────────── Web View ───────────────────────────────────────
 
@@ -330,13 +439,16 @@ class WebView(QWebEngineView):
     QWebEngineView subclass that:
     - Supports autofill injection via PasswordManager
     - Routes popup / new-window requests back to the browser window as new tabs
+    - Shows a custom context menu with "Search with [Engine]" option
     """
 
     def __init__(
         self,
         profile: QWebEngineProfile,
         pm: PasswordManager,
+        config: Optional["ConfigManager"] = None,
         on_popup: Optional[Callable[["WebView"], None]] = None,
+        on_new_tab: Optional[Callable[[str], None]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -344,7 +456,9 @@ class WebView(QWebEngineView):
 
         self.setPage(QWebEnginePage(profile, self))
         self._pm = pm
+        self._config = config
         self._on_popup = on_popup
+        self._on_new_tab = on_new_tab
         self.loadFinished.connect(self._try_autofill)
 
     def _try_autofill(self, ok: bool) -> None:
@@ -365,10 +479,38 @@ class WebView(QWebEngineView):
         self, window_type: "QWebEnginePage.WebWindowType"
     ) -> "WebView":
         """Intercept new-window requests and open them as new tabs."""
-        view = WebView(self.page().profile(), self._pm, self._on_popup)
+        view = WebView(
+            self.page().profile(),
+            self._pm,
+            self._config,
+            self._on_popup,
+            self._on_new_tab,
+        )
         if self._on_popup:
             self._on_popup(view)
         return view
+
+    def contextMenuEvent(self, event) -> None:  # noqa: ANN001
+        """Custom context menu: standard items + 'Search with [Engine]' when text is selected."""
+        menu = self.createStandardContextMenu()
+        selected = self.selectedText().strip()
+        if selected and self._config is not None:
+            engine_name = self._config.search_engine_name()
+            menu.addSeparator()
+            search_action = menu.addAction(f"Search with {engine_name}")
+            search_action.triggered.connect(
+                lambda checked=False, t=selected: self._search_selected(t)
+            )
+        menu.exec(event.globalPos())
+
+    def _search_selected(self, text: str) -> None:
+        if self._config is None:
+            return
+        url = self._config.build_search_url(text)
+        if self._on_new_tab:
+            self._on_new_tab(url)
+        else:
+            self.setUrl(QUrl(url))
 
 
 # ──────────────────────── Bookmark Dialog ────────────────────────────────────
@@ -567,15 +709,266 @@ class PasswordDialog(QDialog):
             QMessageBox.information(self, "Imported", f"{n} credential(s) imported.")
 
 
-# ────────────────────────── Browser Window ───────────────────────────────────
+# ────────────────────────── Draggable Tab Bar ─────────────────────────────────
+
+
+class DraggableTabBar(QTabBar):
+    """
+    QTabBar subclass that:
+    - Allows dragging the frameless window by clicking empty space in the tab bar.
+    - Shows a custom context menu on right-click.
+    """
+
+    def __init__(self, window: QMainWindow, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._window = window
+        self._drag_start: Optional[QPoint] = None
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+    def mousePressEvent(self, event) -> None:  # noqa: ANN001
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Only initiate window drag when clicking in empty tab-bar space.
+            if self.tabAt(event.pos()) == -1:
+                self._drag_start = (
+                    event.globalPosition().toPoint()
+                    - self._window.frameGeometry().topLeft()
+                )
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: ANN001
+        if (
+            event.buttons() & Qt.MouseButton.LeftButton
+            and self._drag_start is not None
+        ):
+            self._window.move(event.globalPosition().toPoint() - self._drag_start)
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001
+        self._drag_start = None
+        super().mouseReleaseEvent(event)
+
+
+# ─────────────────────────── Onboarding Wizard ───────────────────────────────
+
+
+class OnboardingWizard(QDialog):
+    """First-launch wizard: import bookmarks/passwords, pick search engine."""
+
+    def __init__(
+        self,
+        bm: BookmarkManager,
+        pm: PasswordManager,
+        config: ConfigManager,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Welcome to BeepBeep Browser")
+        self.setMinimumSize(520, 440)
+        self._bm = bm
+        self._pm = pm
+        self._config = config
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        # Header
+        title_lbl = QLabel("🦆  Welcome to BeepBeep Browser")
+        title_lbl.setStyleSheet("font-size: 18px; font-weight: bold; padding: 6px 0;")
+        layout.addWidget(title_lbl)
+
+        desc_lbl = QLabel(
+            "Let's get you set up. Import your existing bookmarks and passwords,"
+            " then choose your default search engine."
+        )
+        desc_lbl.setWordWrap(True)
+        layout.addWidget(desc_lbl)
+
+        # ── Bookmarks ────────────────────────────────────────────────────
+        bm_header = QLabel("Import Bookmarks")
+        bm_header.setStyleSheet("font-weight: bold; margin-top: 8px;")
+        layout.addWidget(bm_header)
+
+        bm_row = QHBoxLayout()
+        bm_html_btn = QPushButton("Import from HTML…")
+        bm_json_btn = QPushButton("Import from JSON…")
+        self._bm_status = QLabel("No file selected")
+        bm_html_btn.clicked.connect(self._import_bm_html)
+        bm_json_btn.clicked.connect(self._import_bm_json)
+        bm_row.addWidget(bm_html_btn)
+        bm_row.addWidget(bm_json_btn)
+        bm_row.addWidget(self._bm_status)
+        bm_row.addStretch()
+        layout.addLayout(bm_row)
+
+        # ── Passwords ────────────────────────────────────────────────────
+        pw_header = QLabel("Import Passwords")
+        pw_header.setStyleSheet("font-weight: bold; margin-top: 8px;")
+        layout.addWidget(pw_header)
+
+        pw_desc = QLabel(
+            "Passwords are stored encrypted with your master password."
+            " Import from a plain JSON file."
+        )
+        pw_desc.setWordWrap(True)
+        layout.addWidget(pw_desc)
+
+        pw_row = QHBoxLayout()
+        pw_btn = QPushButton("Import from JSON…")
+        self._pw_status = QLabel("No file selected")
+        pw_btn.clicked.connect(self._import_passwords)
+        pw_row.addWidget(pw_btn)
+        pw_row.addWidget(self._pw_status)
+        pw_row.addStretch()
+        layout.addLayout(pw_row)
+
+        # ── Search engine ────────────────────────────────────────────────
+        se_header = QLabel("Default Search Engine")
+        se_header.setStyleSheet("font-weight: bold; margin-top: 8px;")
+        layout.addWidget(se_header)
+
+        se_row = QHBoxLayout()
+        self._se_combo = QComboBox()
+        for key, (name, _) in SEARCH_ENGINES.items():
+            self._se_combo.addItem(name, key)
+        se_row.addWidget(self._se_combo)
+        se_row.addStretch()
+        layout.addLayout(se_row)
+
+        layout.addStretch()
+
+        finish_btn = QPushButton("Get Started!")
+        finish_btn.clicked.connect(self._finish)
+        layout.addWidget(finish_btn)
+
+    # ── Import helpers ────────────────────────────────────────────────────
+
+    def _import_bm_html(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Bookmarks",
+            "",
+            "HTML files (*.html *.htm);;All files (*)",
+        )
+        if path:
+            try:
+                n = self._bm.import_html(path)
+                self._bm_status.setText(f"Imported {n} bookmark(s)")
+            except Exception as exc:
+                self._bm_status.setText(f"Error: {exc}")
+
+    def _import_bm_json(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Bookmarks", "", "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            count = 0
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and "url" in item:
+                        self._bm.add(item.get("title", item["url"]), item["url"])
+                        count += 1
+            self._bm_status.setText(f"Imported {count} bookmark(s)")
+        except Exception as exc:
+            self._bm_status.setText(f"Error: {exc}")
+
+    def _import_passwords(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Passwords", "", "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        master, ok = QInputDialog.getText(
+            self,
+            "Master Password",
+            "Enter master password:",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok:
+            return
+        if self._pm.unlock(master):
+            try:
+                n = self._pm.import_json(path)
+                self._pw_status.setText(f"Imported {n} credential(s)")
+            except Exception as exc:
+                self._pw_status.setText(f"Error: {exc}")
+        else:
+            self._pw_status.setText("Wrong password or corrupted store")
+
+    def _finish(self) -> None:
+        idx = self._se_combo.currentIndex()
+        key = self._se_combo.itemData(idx)
+        if key:
+            self._config.search_engine = key
+        self._config.onboarding_done = True
+        self._config.save()
+        self.accept()
+
+
+# ──────────────────────────── Settings Dialog ────────────────────────────────
+
+
+class SettingsDialog(QDialog):
+    """Settings dialog: choose search engine."""
+
+    def __init__(self, config: ConfigManager, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumSize(360, 160)
+        self._config = config
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self._se_combo = QComboBox()
+        for key, (name, _) in SEARCH_ENGINES.items():
+            self._se_combo.addItem(name, key)
+
+        current = self._config.search_engine
+        for i in range(self._se_combo.count()):
+            if self._se_combo.itemData(i) == current:
+                self._se_combo.setCurrentIndex(i)
+                break
+
+        form.addRow("Search Engine:", self._se_combo)
+        layout.addLayout(form)
+        layout.addStretch()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._save_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _save_and_accept(self) -> None:
+        key = self._se_combo.itemData(self._se_combo.currentIndex())
+        if key:
+            self._config.search_engine = key
+            self._config.save()
+        self.accept()
 
 
 class BrowserWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, config: ConfigManager) -> None:
         super().__init__()
         self.setWindowTitle("BeepBeep Browser")
         self.resize(1280, 800)
 
+        # Always-on-top, frameless "floating" window.
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+        )
+
+        self._config = config
         app_dir = _app_dir()
         self._bm = BookmarkManager(app_dir)
         self._pm = PasswordManager(app_dir)
@@ -611,22 +1004,57 @@ class BrowserWindow(QMainWindow):
         self._address_bar.returnPressed.connect(self._navigate_from_bar)
         root.addWidget(self._address_bar)
 
-        # Tab widget.
+        # ── Tab widget with custom (draggable) tab bar ───────────────────
         self._tabs = QTabWidget()
+        self._tab_bar = DraggableTabBar(self)
+        self._tabs.setTabBar(self._tab_bar)
         self._tabs.setTabsClosable(True)
         self._tabs.setMovable(True)
         self._tabs.setDocumentMode(True)
         self._tabs.tabCloseRequested.connect(self._close_tab)
         self._tabs.currentChanged.connect(self._on_tab_changed)
+        # Enable right-click context menu on the tab bar.
+        self._tab_bar.customContextMenuRequested.connect(self._show_tab_context_menu)
         root.addWidget(self._tabs)
 
-        # "+" button in the top-right corner of the tab bar.
+        # ── Custom title-bar corner widgets ──────────────────────────────
+        # Left corner: window controls (minimize / close).
+        left_corner = QWidget()
+        left_layout = QHBoxLayout(left_corner)
+        left_layout.setContentsMargins(4, 2, 4, 2)
+        left_layout.setSpacing(4)
+        min_btn = QPushButton("─")
+        min_btn.setFixedSize(22, 22)
+        min_btn.setFlat(True)
+        min_btn.setToolTip("Minimize")
+        min_btn.clicked.connect(self.showMinimized)
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(22, 22)
+        close_btn.setFlat(True)
+        close_btn.setToolTip("Close")
+        close_btn.clicked.connect(self.close)
+        left_layout.addWidget(min_btn)
+        left_layout.addWidget(close_btn)
+        self._tabs.setCornerWidget(left_corner, Qt.Corner.TopLeftCorner)
+
+        # Right corner: new-tab button + settings gear.
+        right_corner = QWidget()
+        right_layout = QHBoxLayout(right_corner)
+        right_layout.setContentsMargins(4, 2, 4, 2)
+        right_layout.setSpacing(4)
         new_tab_btn = QPushButton("+")
-        new_tab_btn.setFixedSize(26, 24)
+        new_tab_btn.setFixedSize(26, 22)
         new_tab_btn.setFlat(True)
         new_tab_btn.setToolTip("New tab  (Ctrl+T)")
         new_tab_btn.clicked.connect(lambda: self.open_tab())
-        self._tabs.setCornerWidget(new_tab_btn, Qt.Corner.TopRightCorner)
+        settings_btn = QPushButton("⚙")
+        settings_btn.setFixedSize(26, 22)
+        settings_btn.setFlat(True)
+        settings_btn.setToolTip("Settings")
+        settings_btn.clicked.connect(self._show_settings)
+        right_layout.addWidget(new_tab_btn)
+        right_layout.addWidget(settings_btn)
+        self._tabs.setCornerWidget(right_corner, Qt.Corner.TopRightCorner)
 
         # ── Keyboard shortcuts ───────────────────────────────────────────
         self._bind_shortcuts()
@@ -709,7 +1137,13 @@ class BrowserWindow(QMainWindow):
 
     def _make_view(self) -> WebView:
         """Create a WebView and wire up all signals."""
-        view = WebView(self._profile, self._pm, on_popup=self._adopt_popup_view)
+        view = WebView(
+            self._profile,
+            self._pm,
+            config=self._config,
+            on_popup=self._adopt_popup_view,
+            on_new_tab=lambda url: self.open_tab(url),
+        )
         view.titleChanged.connect(lambda t, v=view: self._set_tab_title(v, t))
         view.loadStarted.connect(lambda v=view: self._on_load_started(v))
         view.loadProgress.connect(lambda pct, v=view: self._on_load_progress(v, pct))
@@ -752,7 +1186,7 @@ class BrowserWindow(QMainWindow):
         text = self._address_bar.text().strip()
         if not text:
             return
-        # Treat as URL if it looks like one, otherwise search with DuckDuckGo.
+        # Treat as URL if it looks like one, otherwise use the configured search engine.
         if "." in text and " " not in text:
             url = (
                 text
@@ -760,7 +1194,7 @@ class BrowserWindow(QMainWindow):
                 else "https://" + text
             )
         else:
-            url = "https://duckduckgo.com/?q=" + text.replace(" ", "+")
+            url = self._config.build_search_url(text)
         view = self._current_view()
         if view:
             view.setUrl(QUrl(url))
@@ -798,6 +1232,53 @@ class BrowserWindow(QMainWindow):
 
     def _show_passwords(self) -> None:
         PasswordDialog(self._pm, self).exec()
+
+    # ── Settings / search engine ──────────────────────────────────────────
+
+    def _show_settings(self) -> None:
+        SettingsDialog(self._config, self).exec()
+
+    def _set_search_engine(self) -> None:
+        """Quick-pick dialog for selecting the search engine."""
+        names = [SEARCH_ENGINES[k][0] for k in SEARCH_ENGINES]
+        current_name = self._config.search_engine_name()
+        current_idx = names.index(current_name) if current_name in names else 0
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Set Search Engine",
+            "Choose your default search engine:",
+            names,
+            current_idx,
+            False,
+        )
+        if ok and choice:
+            for key, (name, _) in SEARCH_ENGINES.items():
+                if name == choice:
+                    self._config.search_engine = key
+                    self._config.save()
+                    self.statusBar().showMessage(
+                        f"Search engine set to {name}.", 2000
+                    )
+                    break
+
+    # ── Cache ─────────────────────────────────────────────────────────────
+
+    def _clear_cache(self) -> None:
+        self._profile.clearHttpCache()
+        self.statusBar().showMessage("Cache cleared.", 3000)
+
+    # ── Tab-bar context menu ──────────────────────────────────────────────
+
+    def _show_tab_context_menu(self, pos: QPoint) -> None:
+        """Right-click context menu on the tab bar."""
+        menu = QMenu(self)
+        menu.addAction("New Tab", lambda: self.open_tab())
+        menu.addSeparator()
+        menu.addAction("Settings", self._show_settings)
+        menu.addAction("Set Search Engine", self._set_search_engine)
+        menu.addSeparator()
+        menu.addAction("Clear Cache", self._clear_cache)
+        menu.exec(self._tab_bar.mapToGlobal(pos))
 
     # ── Load event plumbing ───────────────────────────────────────────────
 
@@ -918,8 +1399,17 @@ def main() -> None:
     palette.setColor(QPalette.ColorRole.ToolTipText, QColor(220, 220, 220))
     app.setPalette(palette)
 
-    window = BrowserWindow()
+    # Load (or create) persistent config before building the window.
+    config = ConfigManager(_app_dir())
+
+    window = BrowserWindow(config)
     window.show()
+
+    # Run the onboarding wizard on the very first launch (blocks until closed).
+    if not config.onboarding_done:
+        wizard = OnboardingWizard(window._bm, window._pm, config, window)
+        wizard.exec()
+
     sys.exit(app.exec())
 
 
