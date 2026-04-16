@@ -18,6 +18,7 @@ Keyboard Shortcuts:
   Escape        Hide address bar / stop loading
 """
 
+import gc
 import sys
 import os
 import json
@@ -36,7 +37,16 @@ try:
 except ImportError:
     CRYPTO_AVAILABLE = False
 
-from PySide6.QtCore import Qt, QPoint, QUrl, QStandardPaths
+from PySide6.QtCore import (
+    Qt,
+    QEasingCurve,
+    QPoint,
+    QPropertyAnimation,
+    QTimer,
+    QUrl,
+    QStandardPaths,
+    Signal,
+)
 from PySide6.QtGui import QColor, QIcon, QKeySequence, QPalette, QShortcut
 from PySide6.QtWebEngineCore import (
     QWebEngineProfile,
@@ -259,6 +269,11 @@ class PasswordManager:
     def is_unlocked(self) -> bool:
         return self._fernet is not None
 
+    @property
+    def fernet(self) -> "Optional[Fernet]":
+        """Return the active Fernet instance (None if locked)."""
+        return self._fernet
+
     def get(self, domain: str) -> Optional[Tuple[str, str]]:
         """Return (username, password) for *domain*, or None if not stored."""
         entry = self._credentials.get(domain)
@@ -301,12 +316,38 @@ class PasswordManager:
 
 
 class BookmarkManager:
-    """Bookmarks stored as a JSON array in the app-data directory."""
+    """
+    Bookmarks stored as a JSON array in the app-data directory.
+
+    When a Fernet key is provided via ``unlock()``, bookmarks are persisted
+    in encrypted form (``bookmarks.enc``).  Plain ``bookmarks.json`` is kept
+    for backward-compatibility and is migrated to encrypted on first unlock.
+    """
 
     def __init__(self, data_dir: Path) -> None:
         self._file = data_dir / "bookmarks.json"
+        self._enc_file = data_dir / "bookmarks.enc"
+        self._fernet: "Optional[Fernet]" = None
         self._items: List[Dict[str, str]] = []
         self._load()
+
+    # ── Key management ────────────────────────────────────────────────────
+
+    def unlock(self, fernet: "Fernet") -> None:
+        """Set the encryption key and reload / migrate bookmarks."""
+        self._fernet = fernet
+        if self._enc_file.exists():
+            try:
+                raw = fernet.decrypt(self._enc_file.read_bytes())
+                self._items = json.loads(raw)
+                return
+            except Exception:
+                self._items = []
+                return
+        # No encrypted file yet – persist whatever we loaded from plain JSON.
+        self._save()
+
+    # ── Persistence ───────────────────────────────────────────────────────
 
     def _load(self) -> None:
         if self._file.exists():
@@ -316,9 +357,17 @@ class BookmarkManager:
                 self._items = []
 
     def _save(self) -> None:
-        self._file.write_text(
-            json.dumps(self._items, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        data_bytes = json.dumps(self._items, indent=2, ensure_ascii=False).encode()
+        if self._fernet is not None:
+            self._enc_file.write_bytes(self._fernet.encrypt(data_bytes))
+            # Remove the unencrypted file once migration is complete.
+            if self._file.exists():
+                try:
+                    self._file.unlink()
+                except OSError:
+                    pass
+        else:
+            self._file.write_text(data_bytes.decode(), encoding="utf-8")
 
     def add(self, title: str, url: str) -> None:
         if not any(b["url"] == url for b in self._items):
@@ -780,11 +829,47 @@ class OnboardingWizard(QDialog):
         layout.addWidget(title_lbl)
 
         desc_lbl = QLabel(
-            "Let's get you set up. Import your existing bookmarks and passwords,"
-            " then choose your default search engine."
+            "Let's get you set up. First create a Master Password to secure your data,"
+            " then optionally import bookmarks and passwords."
         )
         desc_lbl.setWordWrap(True)
         layout.addWidget(desc_lbl)
+
+        # ── Master Password (required) ────────────────────────────────────
+        if CRYPTO_AVAILABLE:
+            mp_header = QLabel("🔐  Create Master Password  (required)")
+            mp_header.setStyleSheet("font-weight: bold; margin-top: 8px;")
+            layout.addWidget(mp_header)
+
+            mp_desc = QLabel(
+                "Your Master Password encrypts all stored passwords and bookmarks."
+                " Choose something strong and memorable — it cannot be recovered."
+            )
+            mp_desc.setWordWrap(True)
+            layout.addWidget(mp_desc)
+
+            mp_form = QFormLayout()
+            self._mp_edit = QLineEdit()
+            self._mp_edit.setEchoMode(QLineEdit.EchoMode.Password)
+            self._mp_edit.setPlaceholderText("At least 8 characters")
+            self._mp_confirm = QLineEdit()
+            self._mp_confirm.setEchoMode(QLineEdit.EchoMode.Password)
+            self._mp_confirm.setPlaceholderText("Re-enter to confirm")
+            mp_form.addRow("Password:", self._mp_edit)
+            mp_form.addRow("Confirm:", self._mp_confirm)
+            layout.addLayout(mp_form)
+
+            self._mp_status = QLabel("")
+            self._mp_status.setStyleSheet("color: #ff6b6b;")
+            layout.addWidget(self._mp_status)
+        else:
+            no_crypto_lbl = QLabel(
+                "⚠️  The 'cryptography' package is not installed — "
+                "data will be stored unencrypted."
+            )
+            no_crypto_lbl.setWordWrap(True)
+            no_crypto_lbl.setStyleSheet("color: #ffa040;")
+            layout.addWidget(no_crypto_lbl)
 
         # ── Bookmarks ────────────────────────────────────────────────────
         bm_header = QLabel("Import Bookmarks")
@@ -809,8 +894,8 @@ class OnboardingWizard(QDialog):
         layout.addWidget(pw_header)
 
         pw_desc = QLabel(
-            "Passwords are stored encrypted with your master password."
-            " Import from a plain JSON file."
+            "Import existing passwords from a plain JSON file "
+            "(they will be re-encrypted with your Master Password)."
         )
         pw_desc.setWordWrap(True)
         layout.addWidget(pw_desc)
@@ -884,24 +969,49 @@ class OnboardingWizard(QDialog):
         )
         if not path:
             return
-        master, ok = QInputDialog.getText(
-            self,
-            "Master Password",
-            "Enter master password:",
-            QLineEdit.EchoMode.Password,
-        )
-        if not ok:
-            return
-        if self._pm.unlock(master):
+        # Use the master password the user is creating in this wizard (if set).
+        if CRYPTO_AVAILABLE and hasattr(self, "_mp_edit"):
+            master = self._mp_edit.text()
+            if not master:
+                self._pw_status.setText("Enter a Master Password above first.")
+                return
+            ok = self._pm.unlock(master)
+        else:
+            master, ok_input = QInputDialog.getText(
+                self,
+                "Master Password",
+                "Enter master password:",
+                QLineEdit.EchoMode.Password,
+            )
+            ok = ok_input and self._pm.unlock(master)
+        if ok:
             try:
                 n = self._pm.import_json(path)
                 self._pw_status.setText(f"Imported {n} credential(s)")
             except Exception as exc:
                 self._pw_status.setText(f"Error: {exc}")
         else:
-            self._pw_status.setText("Wrong password or corrupted store")
+            self._pw_status.setText("Wrong password or could not initialise store")
 
     def _finish(self) -> None:
+        if CRYPTO_AVAILABLE and hasattr(self, "_mp_edit"):
+            pw = self._mp_edit.text()
+            confirm = self._mp_confirm.text()
+            if not pw:
+                self._mp_status.setText("Master password is required.")
+                return
+            if len(pw) < 8:
+                self._mp_status.setText("Password must be at least 8 characters.")
+                return
+            if pw != confirm:
+                self._mp_status.setText("Passwords do not match.")
+                return
+            if not self._pm.unlock(pw):
+                self._mp_status.setText("Failed to initialise credential store.")
+                return
+            # Unlock bookmarks with the same Fernet key so they are encrypted too.
+            if self._pm.fernet is not None:
+                self._bm.unlock(self._pm.fernet)
         idx = self._se_combo.currentIndex()
         key = self._se_combo.itemData(idx)
         if key:
@@ -909,6 +1019,138 @@ class OnboardingWizard(QDialog):
         self._config.onboarding_done = True
         self._config.save()
         self.accept()
+
+
+# ────────────────────────────── Lock Screen ──────────────────────────────────
+
+
+class LockScreen(QWidget):
+    """
+    Minimalist fullscreen overlay shown on startup.
+
+    The browser window is visible behind the overlay but inaccessible until
+    the correct Master Password is entered.  On success the ``unlocked``
+    signal is emitted and the caller is responsible for hiding/removing this
+    widget.
+    """
+
+    unlocked = Signal()
+
+    def __init__(self, pm: PasswordManager, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._pm = pm
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "LockScreen { background: rgba(8, 8, 14, 0.96); }"
+        )
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Frosted-glass card
+        card = QWidget()
+        card.setFixedWidth(360)
+        card.setStyleSheet(
+            "QWidget {"
+            "  background: rgba(28, 28, 38, 0.94);"
+            "  border: 1px solid rgba(255,255,255,0.12);"
+            "  border-radius: 18px;"
+            "}"
+        )
+        form = QVBoxLayout(card)
+        form.setSpacing(14)
+        form.setContentsMargins(32, 36, 32, 32)
+
+        icon_lbl = QLabel("🔒")
+        icon_lbl.setStyleSheet("font-size: 42px; background: transparent; border: none;")
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+        title_lbl = QLabel("BeepBeep Browser")
+        title_lbl.setStyleSheet(
+            "font-size: 22px; font-weight: bold; color: #e2e2ee;"
+            " background: transparent; border: none;"
+        )
+        title_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+        sub_lbl = QLabel("Enter your Master Password to continue")
+        sub_lbl.setStyleSheet(
+            "font-size: 12px; color: rgba(175, 175, 195, 0.85);"
+            " background: transparent; border: none;"
+        )
+        sub_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+        self._pw_edit = QLineEdit()
+        self._pw_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pw_edit.setPlaceholderText("Master Password")
+        self._pw_edit.setFixedHeight(40)
+        self._pw_edit.setStyleSheet(
+            "QLineEdit {"
+            "  background: rgba(18, 18, 26, 0.92);"
+            "  border: 1px solid rgba(255,255,255,0.16);"
+            "  border-radius: 9px;"
+            "  padding: 0 14px;"
+            "  font-size: 14px;"
+            "  color: #e2e2ee;"
+            "}"
+            "QLineEdit:focus { border-color: rgba(74, 158, 255, 0.65); }"
+        )
+
+        self._err_lbl = QLabel("")
+        self._err_lbl.setStyleSheet(
+            "color: #ff6b6b; font-size: 12px; background: transparent; border: none;"
+        )
+        self._err_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._err_lbl.hide()
+
+        unlock_btn = QPushButton("Unlock")
+        unlock_btn.setFixedHeight(40)
+        unlock_btn.setStyleSheet(
+            "QPushButton {"
+            "  background: qlineargradient("
+            "    x1:0, y1:0, x2:1, y2:0,"
+            "    stop:0 #4a9eff, stop:1 #6e5fff"
+            "  );"
+            "  border: none;"
+            "  border-radius: 9px;"
+            "  color: #ffffff;"
+            "  font-size: 14px;"
+            "  font-weight: bold;"
+            "}"
+            "QPushButton:hover { background: qlineargradient("
+            "  x1:0, y1:0, x2:1, y2:0, stop:0 #5aaaff, stop:1 #7e6fff); }"
+            "QPushButton:pressed { background: #3a8eef; }"
+        )
+
+        form.addWidget(icon_lbl)
+        form.addWidget(title_lbl)
+        form.addWidget(sub_lbl)
+        form.addWidget(self._pw_edit)
+        form.addWidget(self._err_lbl)
+        form.addWidget(unlock_btn)
+
+        outer.addWidget(card)
+
+        unlock_btn.clicked.connect(self._do_unlock)
+        self._pw_edit.returnPressed.connect(self._do_unlock)
+
+    def _do_unlock(self) -> None:
+        pw = self._pw_edit.text()
+        if self._pm.unlock(pw):
+            self._err_lbl.hide()
+            self.unlocked.emit()
+        else:
+            self._pw_edit.clear()
+            self._err_lbl.setText("Incorrect password — data remains encrypted.")
+            self._err_lbl.show()
+
+    def showEvent(self, event) -> None:  # noqa: ANN001
+        super().showEvent(event)
+        parent_w = self.parentWidget()
+        if parent_w:
+            self.resize(parent_w.size())
+        self._pw_edit.setFocus()
 
 
 # ──────────────────────────── Settings Dialog ────────────────────────────────
@@ -968,6 +1210,9 @@ class BrowserWindow(QMainWindow):
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
         )
 
+        # Lock-screen overlay (None until show_lock_screen() is called).
+        self._lock_screen: Optional[LockScreen] = None
+
         self._config = config
         app_dir = _app_dir()
         self._bm = BookmarkManager(app_dir)
@@ -992,17 +1237,25 @@ class BrowserWindow(QMainWindow):
         self._progress.hide()
         self._progress.setStyleSheet(
             "QProgressBar { background: transparent; border: none; }"
-            "QProgressBar::chunk { background: #4a9eff; }"
+            "QProgressBar::chunk { background: "
+            "  qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #4a9eff,stop:1 #7b5fff); }"
         )
         root.addWidget(self._progress)
 
         # Address bar (hidden by default, shown with Ctrl+L).
+        # maximumHeight is animated — do NOT call setFixedHeight here.
         self._address_bar = QLineEdit()
         self._address_bar.setPlaceholderText("Enter URL or search…")
-        self._address_bar.setFixedHeight(30)
+        self._address_bar.setMinimumHeight(0)
+        self._address_bar.setMaximumHeight(0)   # starts collapsed
         self._address_bar.hide()
         self._address_bar.returnPressed.connect(self._navigate_from_bar)
         root.addWidget(self._address_bar)
+
+        # Address-bar slide animation (reused for show and hide).
+        self._addr_anim = QPropertyAnimation(self._address_bar, b"maximumHeight", self)
+        self._addr_anim.setDuration(180)
+        self._addr_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
         # ── Tab widget with custom (draggable) tab bar ───────────────────
         self._tabs = QTabWidget()
@@ -1056,8 +1309,19 @@ class BrowserWindow(QMainWindow):
         right_layout.addWidget(settings_btn)
         self._tabs.setCornerWidget(right_corner, Qt.Corner.TopRightCorner)
 
+        # ── Apply glassmorphism / pill-tab stylesheet ─────────────────────
+        self._apply_stylesheet()
+
+        # ── Try Windows Acrylic blur-behind ──────────────────────────────
+        self._apply_acrylic_effect()
+
         # ── Keyboard shortcuts ───────────────────────────────────────────
         self._bind_shortcuts()
+
+        # ── GC timer: Python garbage collection every 60 seconds ─────────
+        self._gc_timer = QTimer(self)
+        self._gc_timer.timeout.connect(gc.collect)
+        self._gc_timer.start(60_000)
 
         # Open the first tab.
         self.open_tab(HOME_URL)
@@ -1125,14 +1389,181 @@ class BrowserWindow(QMainWindow):
         script.setRunsOnSubFrames(sub_frames)
         self._profile.scripts().insert(script)
 
+    # ── Stylesheet & visual helpers ───────────────────────────────────────
+
+    def _apply_stylesheet(self) -> None:
+        """Apply glassmorphism + pill-tab stylesheet to the whole window."""
+        self.setStyleSheet(
+            # ── Window / central background ──
+            "QMainWindow, QWidget { background: rgba(18, 18, 24, 0.98); }"
+
+            # ── Tab pane ──
+            "QTabWidget::pane { border: none; background: transparent; }"
+            "QTabWidget::tab-bar { alignment: left; }"
+
+            # ── Tab bar background ──
+            "QTabBar {"
+            "  background: rgba(22, 22, 30, 0.90);"
+            "  border-bottom: 1px solid rgba(255,255,255,0.07);"
+            "}"
+
+            # ── Pill tabs ──
+            "QTabBar::tab {"
+            "  background: rgba(255,255,255,0.05);"
+            "  border: 1px solid rgba(255,255,255,0.09);"
+            "  border-radius: 13px;"
+            "  padding: 4px 20px;"
+            "  margin: 3px 2px;"
+            "  color: rgba(200,200,215,0.82);"
+            "  min-width: 70px;"
+            "  max-width: 210px;"
+            "}"
+            "QTabBar::tab:selected {"
+            "  background: rgba(74,158,255,0.17);"
+            "  border: 1.5px solid rgba(74,158,255,0.72);"
+            "  color: #ffffff;"
+            "}"
+            "QTabBar::tab:only-one {"
+            "  background: rgba(74,158,255,0.17);"
+            "  border: 1.5px solid rgba(74,158,255,0.72);"
+            "  color: #ffffff;"
+            "}"
+            "QTabBar::tab:hover:!selected {"
+            "  background: rgba(255,255,255,0.11);"
+            "  border-color: rgba(255,255,255,0.18);"
+            "}"
+            "QTabBar::close-button { image: none; }"
+
+            # ── Address bar ──
+            "QLineEdit {"
+            "  background: rgba(28,28,38,0.92);"
+            "  border: 1px solid rgba(255,255,255,0.11);"
+            "  border-radius: 7px;"
+            "  padding: 0 12px;"
+            "  color: #dcdce8;"
+            "  font-size: 13px;"
+            "  selection-background-color: rgba(74,158,255,0.40);"
+            "}"
+            "QLineEdit:focus {"
+            "  border-color: rgba(74,158,255,0.60);"
+            "  background: rgba(28,28,42,0.96);"
+            "}"
+
+            # ── Flat / icon buttons ──
+            "QPushButton:flat {"
+            "  background: transparent;"
+            "  border: none;"
+            "  color: #c8c8d6;"
+            "}"
+            "QPushButton:flat:hover {"
+            "  background: rgba(255,255,255,0.09);"
+            "  border-radius: 5px;"
+            "}"
+
+            # ── Normal buttons (dialogs, etc.) ──
+            "QPushButton {"
+            "  background: rgba(255,255,255,0.06);"
+            "  border: 1px solid rgba(255,255,255,0.10);"
+            "  border-radius: 6px;"
+            "  color: #c8c8d6;"
+            "  padding: 3px 10px;"
+            "}"
+            "QPushButton:hover {"
+            "  background: rgba(255,255,255,0.11);"
+            "  border-color: rgba(255,255,255,0.20);"
+            "}"
+            "QPushButton:pressed { background: rgba(74,158,255,0.20); }"
+
+            # ── Status bar ──
+            "QStatusBar {"
+            "  background: rgba(14,14,20,0.96);"
+            "  color: rgba(180,180,200,0.70);"
+            "  font-size: 11px;"
+            "  border-top: 1px solid rgba(255,255,255,0.05);"
+            "}"
+
+            # ── Progress bar ──
+            "QProgressBar { background: transparent; border: none; }"
+            "QProgressBar::chunk {"
+            "  background: qlineargradient("
+            "    x1:0,y1:0,x2:1,y2:0,stop:0 #4a9eff,stop:1 #7b5fff); }"
+        )
+
+    def _apply_acrylic_effect(self) -> None:
+        """
+        Attempt to enable Windows 10/11 Acrylic blur-behind via DWM.
+
+        Silently ignored on non-Windows or older Windows builds that lack the
+        required DWM attributes.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            import ctypes.wintypes
+            hwnd = int(self.winId())
+            dwmapi = ctypes.windll.dwmapi  # type: ignore[attr-defined]
+            # Enable immersive dark mode title bar (if applicable).
+            DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+            dwmapi.DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                ctypes.byref(ctypes.c_int(1)),
+                ctypes.sizeof(ctypes.c_int),
+            )
+            # Request Acrylic system backdrop (Windows 11 22H2+).
+            DWMWA_SYSTEMBACKDROP_TYPE = 38
+            dwmapi.DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                ctypes.byref(ctypes.c_int(3)),   # 3 = Acrylic
+                ctypes.sizeof(ctypes.c_int),
+            )
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        except Exception:
+            pass  # Non-critical; gracefully degrade on unsupported hosts.
+
+    # ── Lock screen ───────────────────────────────────────────────────────
+
+    def show_lock_screen(self) -> None:
+        """Overlay the browser window with the Master Password lock screen."""
+        self._lock_screen = LockScreen(self._pm, self)
+        self._lock_screen.unlocked.connect(self._on_unlocked)
+        self._lock_screen.show()
+        self._lock_screen.raise_()
+
+    def _on_unlocked(self) -> None:
+        """Called when the lock screen emits ``unlocked``."""
+        if self._lock_screen is not None:
+            self._lock_screen.hide()
+            self._lock_screen.deleteLater()
+            self._lock_screen = None
+        # Unlock the bookmark manager with the same derived key.
+        if CRYPTO_AVAILABLE and self._pm.fernet is not None:
+            self._bm.unlock(self._pm.fernet)
+
+    # ── Qt event overrides ────────────────────────────────────────────────
+
+    def showEvent(self, event) -> None:  # noqa: ANN001
+        super().showEvent(event)
+        if self._lock_screen is not None:
+            self._lock_screen.resize(self.size())
+            self._lock_screen.raise_()
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        if self._lock_screen is not None:
+            self._lock_screen.resize(self.size())
+
     # ── Tab management ────────────────────────────────────────────────────
 
     def open_tab(self, url: str = HOME_URL) -> WebView:
-        """Create a new tab and navigate to *url*."""
+        """Create a new tab.  Web content is loaded lazily on first focus."""
         view = self._make_view()
+        view._pending_url = url  # type: ignore[attr-defined]
         idx = self._tabs.addTab(view, "New Tab")
         self._tabs.setCurrentIndex(idx)
-        view.setUrl(QUrl(url))
+        # Actual setUrl() call is deferred to _on_tab_changed.
         return view
 
     def _make_view(self) -> WebView:
@@ -1198,18 +1629,47 @@ class BrowserWindow(QMainWindow):
         view = self._current_view()
         if view:
             view.setUrl(QUrl(url))
-        self._address_bar.hide()
+        self._hide_address_bar()
+
+    # ── Address-bar animation helpers ─────────────────────────────────────
+
+    def _show_address_bar(self) -> None:
+        if self._address_bar.isVisible():
+            return
+        view = self._current_view()
+        if view:
+            self._address_bar.setText(view.url().toString())
+        self._addr_anim.stop()
+        try:
+            self._addr_anim.finished.disconnect()
+        except RuntimeError:
+            pass
+        self._address_bar.setMaximumHeight(0)
+        self._address_bar.show()
+        self._addr_anim.setStartValue(0)
+        self._addr_anim.setEndValue(32)
+        self._addr_anim.start()
+        self._address_bar.setFocus()
+        self._address_bar.selectAll()
+
+    def _hide_address_bar(self) -> None:
+        if not self._address_bar.isVisible():
+            return
+        self._addr_anim.stop()
+        try:
+            self._addr_anim.finished.disconnect()
+        except RuntimeError:
+            pass
+        self._addr_anim.setStartValue(self._address_bar.maximumHeight() or 32)
+        self._addr_anim.setEndValue(0)
+        self._addr_anim.finished.connect(self._address_bar.hide)
+        self._addr_anim.start()
 
     def _toggle_address_bar(self) -> None:
         if self._address_bar.isVisible():
-            self._address_bar.hide()
+            self._hide_address_bar()
         else:
-            view = self._current_view()
-            if view:
-                self._address_bar.setText(view.url().toString())
-            self._address_bar.show()
-            self._address_bar.setFocus()
-            self._address_bar.selectAll()
+            self._show_address_bar()
 
     # ── Bookmarks ─────────────────────────────────────────────────────────
 
@@ -1274,11 +1734,26 @@ class BrowserWindow(QMainWindow):
         menu = QMenu(self)
         menu.addAction("New Tab", lambda: self.open_tab())
         menu.addSeparator()
+        is_on_top = bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
+        on_top_act = menu.addAction("Always on Top")
+        on_top_act.setCheckable(True)
+        on_top_act.setChecked(is_on_top)
+        on_top_act.triggered.connect(self._toggle_always_on_top)
+        menu.addSeparator()
         menu.addAction("Settings", self._show_settings)
         menu.addAction("Set Search Engine", self._set_search_engine)
         menu.addSeparator()
         menu.addAction("Clear Cache", self._clear_cache)
         menu.exec(self._tab_bar.mapToGlobal(pos))
+
+    def _toggle_always_on_top(self) -> None:
+        flags = self.windowFlags()
+        if flags & Qt.WindowType.WindowStaysOnTopHint:
+            flags &= ~Qt.WindowType.WindowStaysOnTopHint
+        else:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        self.show()
 
     # ── Load event plumbing ───────────────────────────────────────────────
 
@@ -1303,7 +1778,14 @@ class BrowserWindow(QMainWindow):
 
     def _on_tab_changed(self, _index: int) -> None:
         view = self._current_view()
-        if view and self._address_bar.isVisible():
+        if view is None:
+            return
+        # Lazy load: trigger the first page load when the tab is focused.
+        pending = getattr(view, "_pending_url", None)
+        if pending is not None:
+            view._pending_url = None  # type: ignore[attr-defined]
+            view.setUrl(QUrl(pending))
+        if self._address_bar.isVisible():
             self._address_bar.setText(view.url().toString())
 
     def _on_url_changed(self, url: QUrl) -> None:
@@ -1344,7 +1826,7 @@ class BrowserWindow(QMainWindow):
 
     def _on_escape(self) -> None:
         if self._address_bar.isVisible():
-            self._address_bar.hide()
+            self._hide_address_bar()
         elif self.isFullScreen():
             self.showNormal()
         else:
@@ -1371,11 +1853,12 @@ class BrowserWindow(QMainWindow):
 
 
 def main() -> None:
-    # Hint to Chromium to reduce background resource usage.
-    os.environ.setdefault(
-        "QTWEBENGINE_CHROMIUM_FLAGS",
+    # Zero-Bloat Chromium flags for minimal RAM and CPU overhead.
+    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
         "--disable-extensions --disable-sync --disable-translate "
-        "--disable-background-networking --disable-default-apps",
+        "--disable-background-networking --disable-default-apps "
+        "--disable-gpu-shader-disk-cache --disable-reading-from-canvas "
+        "--disable-notifications --single-process"
     )
 
     app = QApplication(sys.argv)
@@ -1403,12 +1886,18 @@ def main() -> None:
     config = ConfigManager(_app_dir())
 
     window = BrowserWindow(config)
-    window.show()
 
-    # Run the onboarding wizard on the very first launch (blocks until closed).
     if not config.onboarding_done:
+        # First launch: show the window, then immediately run the wizard.
+        window.show()
         wizard = OnboardingWizard(window._bm, window._pm, config, window)
         wizard.exec()
+    else:
+        # Subsequent launches: show lock screen if a master password exists.
+        salt_file = _app_dir() / "salt.bin"
+        if salt_file.exists():
+            window.show_lock_screen()
+        window.show()
 
     sys.exit(app.exec())
 
